@@ -1,5 +1,10 @@
-from typing import Dict, List, Optional, Sequence, Tuple
+from __future__ import annotations
 
+from typing import Dict, List, Optional, Sequence, Tuple
+import json
+import os
+
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -27,10 +32,78 @@ FREQ_FOR_CLASS: List[str] = [
     "12hz",  # 13: situps (complx)
     "6hz",   # 14: stretching (hamstrings)
     "6hz",   # 15: stretching (lumbar rotation)
-    "6hz",  # 16: stretching (lunging)
-    "6hz",  # 17: stretching (shoulders)
-    "6hz",  # 18: stretching (triceps)
+    "6hz",   # 16: stretching (lunging)
+    "6hz",   # 17: stretching (shoulders)
+    "6hz",   # 18: stretching (triceps)
 ]
+
+
+def load_freq_mapping(path: str) -> List[str]:
+    """
+    Load a class->frequency mapping.
+
+    Supported formats:
+      - JSON:
+          * list of strings, where index = class_id
+          * dict mapping class_id (int/str) -> freq_tag
+      - CSV:
+          must contain columns: class_id and freq_tag (or best_freq_tag / best_frequency)
+
+    Returns:
+      list[str] of length (max_class_id+1)
+    """
+    if path is None or str(path).strip() == "":
+        raise ValueError("path must be a non-empty string")
+    path = str(path)
+
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Frequency mapping file not found: {path}")
+
+    if path.lower().endswith(".json"):
+        with open(path, "r") as f:
+            obj = json.load(f)
+        if isinstance(obj, list):
+            return [str(x) for x in obj]
+        if isinstance(obj, dict):
+            pairs = []
+            for k, v in obj.items():
+                try:
+                    ki = int(k)
+                except Exception:
+                    continue
+                pairs.append((ki, str(v)))
+            if not pairs:
+                raise ValueError(f"No valid class_id entries found in JSON mapping: {path}")
+            max_k = max(k for k, _ in pairs)
+            out = ["25hz"] * (max_k + 1)
+            for k, v in pairs:
+                out[k] = v
+            return out
+        raise ValueError(f"Unsupported JSON mapping structure in {path}: {type(obj)}")
+
+    df = pd.read_csv(path)
+    if "class_id" not in df.columns:
+        raise ValueError(f"CSV mapping missing 'class_id' column: {path}")
+
+    tag_col = None
+    for cand in ("freq_tag", "best_freq_tag", "best_frequency", "best_freq"):
+        if cand in df.columns:
+            tag_col = cand
+            break
+    if tag_col is None:
+        raise ValueError(
+            f"CSV mapping must contain one of: freq_tag, best_freq_tag, best_frequency, best_freq. Got: {list(df.columns)}"
+        )
+
+    df = df[["class_id", tag_col]].copy()
+    df["class_id"] = df["class_id"].astype(int)
+    df[tag_col] = df[tag_col].astype(str)
+
+    max_id = int(df["class_id"].max())
+    out = ["25hz"] * (max_id + 1)
+    for _, r in df.iterrows():
+        out[int(r["class_id"])] = str(r[tag_col])
+    return out
 
 
 class MultiFreqDeepConvLSTM(nn.Module):
@@ -41,6 +114,7 @@ class MultiFreqDeepConvLSTM(nn.Module):
         model_25hz: nn.Module,
         model_50hz: Optional[nn.Module] = None,
         freq_for_class: Optional[Sequence[str]] = None,
+        freq_mapping_path: Optional[str] = None,
         history_len: int = 5,
         stability_threshold: float = 0.8,
         min_confidence: float = 0.6,
@@ -53,11 +127,14 @@ class MultiFreqDeepConvLSTM(nn.Module):
         self.model_25hz = model_25hz
         self.model_50hz = model_50hz
 
-        self.freq_for_class: List[str] = list(freq_for_class) if freq_for_class is not None else list(FREQ_FOR_CLASS)
+        if freq_mapping_path is not None and str(freq_mapping_path).strip():
+            self.freq_for_class = load_freq_mapping(freq_mapping_path)
+        else:
+            self.freq_for_class = list(freq_for_class) if freq_for_class is not None else list(FREQ_FOR_CLASS)
 
-        self.history_len = history_len
-        self.stability_threshold = stability_threshold
-        self.min_confidence = min_confidence
+        self.history_len = int(history_len)
+        self.stability_threshold = float(stability_threshold)
+        self.min_confidence = float(min_confidence)
 
         self.available_models: Dict[str, Optional[nn.Module]] = {
             "6hz": self.model_6hz,
@@ -66,8 +143,6 @@ class MultiFreqDeepConvLSTM(nn.Module):
             "50hz": self.model_50hz,
         }
 
-        # Default selection when history is not stable / confident.
-        # If a 50 Hz expert is provided, it is a sensible "safety net".
         if default_freq is not None:
             self.default_freq = str(default_freq)
         else:
@@ -111,14 +186,12 @@ class MultiFreqDeepConvLSTM(nn.Module):
         if stability >= self.stability_threshold and avg_conf >= self.min_confidence:
             if 0 <= majority_class < len(self.freq_for_class):
                 cand = self.freq_for_class[majority_class]
-                # If mapping requests a frequency that isn't available, fall back.
                 if cand in self.available_models and self.available_models[cand] is not None:
                     return cand
                 return self.default_freq
-            else:
-                return self.default_freq
-        else:
             return self.default_freq
+
+        return self.default_freq
 
     def step(
         self,

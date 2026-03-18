@@ -1,0 +1,44 @@
+name: deepconvlstm
+dataset_name: wisdm_watch_accel
+has_null: False
+
+anno_json:
+  - 'data/wisdm/annotations/Multirate/watch_accel/loso_sbj_0.json'
+  # ... keep the rest exactly as in your current accel config ...
+  - 'data/wisdm/annotations/Multirate/watch_accel/loso_sbj_50.json'
+
+dataset:
+  sens_folder: ./data/wisdm/processed/watch_accel_wearformat_20hz
+  input_dim: 3
+  sampling_rate: 20
+  num_classes: 18
+  window_size: 20
+  window_overlap: 50
+  tiou_thresholds: [0.3, 0.4, 0.5, 0.6, 0.7]
+
+model:
+  conv_kernels: 64
+  conv_kernel_size: 9
+  lstm_units: 128
+  lstm_layers: 1
+  dropout: 0.5
+  conv_type: 'continuous'
+  conv_rank: 8
+  conv_mlp_hidden_dim: 32
+  supported_sample_rates: [20, 10, 5]
+  multirate_training: True
+
+train_cfg:
+  lr: 0.0001
+  lr_decay: 0.9
+  lr_step: 10
+  epochs: 30
+  weight_decay: 0.000001
+  weight_init: 'xavier_normal'
+  weighted_loss: True
+  auto_resume: True
+  log_subdir: experiments/continuous/wisdm_watch_accel
+
+loader:
+  train_batch_size: 100
+  test_batch_size: 1

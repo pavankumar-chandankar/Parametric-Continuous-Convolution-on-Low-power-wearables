@@ -1,4 +1,4 @@
-from typing import Sequence
+from typing import Optional, Sequence
 
 from torch import nn
 import torch
@@ -11,19 +11,18 @@ from models.continuous_conv import ContinuousConv2d
 
 class DeepConvLSTM(nn.Module):
     """
-    Single checkpoint contains 4 frequency-specific ContinuousConv branches:
-      - branches["50"], branches["25"], branches["12"], branches["6"]
+    DeepConvLSTM with optional frequency-adaptive front-end.
 
-    Training (LOSO loop unchanged):
-      - If conv_type == "continuous", we do multi-rate training inside forward():
-        pick one of {50,25,12,6}, resample window to that length, and train that branch.
+    conv_type:
+      - "standard": single fixed Conv2d stack
+      - "continuous": coordinate-conditioned ("MLP kernel") conv stack with
+        frequency-specific branches + optional multirate training inside forward()
+      - "standard_multibranch": baseline multi-rate single-checkpoint model:
+        one fixed-kernel Conv2d stack per supported rate + optional multirate training
 
-    Inference:
-      - chooses branch based on input length T (snapped to nearest supported rate).
-
-    Debug:
-      - self.last_sample_rate is set to the Hz branch used for the last forward().
-        The training loop can read this to print branch usage stats.
+    standard_padding:
+      - "valid": no padding (legacy behavior)
+      - "same": time padding so temporal length is preserved per conv layer
     """
 
     def __init__(
@@ -45,39 +44,50 @@ class DeepConvLSTM(nn.Module):
         conv_mlp_hidden_dim=32,
         supported_sample_rates: Sequence[int] = (50, 25, 12, 6),
         multirate_training: bool = True,
+        kernel_support_s: Optional[float] = None,
+        standard_padding: str = "valid",
     ):
-        super(DeepConvLSTM, self).__init__()
+        super().__init__()
 
         self.gamma_quant = gamma_quant
-        self.channels = channels
-        self.classes = classes
-        self.window_size = window_size
-        self.conv_kernels = conv_kernels
-        self.conv_kernel_size = conv_kernel_size
-        self.lstm_units = lstm_units
-        self.lstm_layers = lstm_layers
-        self.dropout_p = dropout
-        self.conv_type = conv_type
+        self.channels = int(channels)
+        self.classes = int(classes)
+        self.window_size = int(window_size)
+        self.conv_kernels = int(conv_kernels)
+        self.conv_kernel_size = int(conv_kernel_size)
+        self.lstm_units = int(lstm_units)
+        self.lstm_layers = int(lstm_layers)
+        self.dropout_p = float(dropout)
+        self.conv_type = str(conv_type)
+
+        standard_padding = str(standard_padding)
+        if standard_padding not in ("valid", "same"):
+            raise ValueError(f"standard_padding must be 'valid' or 'same', got: {standard_padding}")
+        self.standard_padding = standard_padding
+        pad_t = (self.conv_kernel_size // 2) if (self.standard_padding == "same") else 0
+        self._std_pad = (pad_t, 0)
 
         self.supported_sample_rates = [int(x) for x in supported_sample_rates]
-        self.multirate_training = bool(multirate_training) and (conv_type == "continuous")
+        self.multirate_training = bool(multirate_training) and (self.conv_type in ("continuous", "standard_multibranch"))
 
         # Debug: used by train.py to print branch usage stats
         self.last_sample_rate = None  # int | None
 
-        # In WEAR configs here: 1-second windows, so window_size == 50 for the base config.
-        base_fs = float(window_size) if float(window_size) > 0 else 50.0
-        self.kernel_support_s = float(conv_kernel_size) / base_fs
+        # In our datasets, configs use ~1-second windows where window_size == sampling_rate.
+        # So conv_kernel_size / window_size is a reasonable "seconds" support default.
+        base_fs = float(self.window_size) if float(self.window_size) > 0 else 50.0
+        if kernel_support_s is not None:
+            self.kernel_support_s = float(kernel_support_s)
+        else:
+            self.kernel_support_s = float(self.conv_kernel_size) / base_fs
 
-        if conv_type == "standard":
-            self.conv1 = nn.Conv2d(1, conv_kernels, (conv_kernel_size, 1))
-            self.conv2 = nn.Conv2d(conv_kernels, conv_kernels, (conv_kernel_size, 1))
-            self.conv3 = nn.Conv2d(conv_kernels, conv_kernels, (conv_kernel_size, 1))
-            self.conv4 = nn.Conv2d(conv_kernels, conv_kernels, (conv_kernel_size, 1))
-            self.final_seq_len = window_size - (conv_kernel_size - 1) * 4
+        if self.conv_type == "standard":
+            self.conv1 = nn.Conv2d(1, conv_kernels, (conv_kernel_size, 1), padding=self._std_pad)
+            self.conv2 = nn.Conv2d(conv_kernels, conv_kernels, (conv_kernel_size, 1), padding=self._std_pad)
+            self.conv3 = nn.Conv2d(conv_kernels, conv_kernels, (conv_kernel_size, 1), padding=self._std_pad)
+            self.conv4 = nn.Conv2d(conv_kernels, conv_kernels, (conv_kernel_size, 1), padding=self._std_pad)
 
-        elif conv_type == "continuous":
-            # 4 separate branches inside one model checkpoint
+        elif self.conv_type == "continuous":
             self.branches = nn.ModuleDict()
             for fs in self.supported_sample_rates:
                 self.branches[str(int(fs))] = nn.ModuleList(
@@ -120,18 +130,29 @@ class DeepConvLSTM(nn.Module):
                         ),
                     ]
                 )
-            self.final_seq_len = window_size
+
+        elif self.conv_type == "standard_multibranch":
+            self.branches = nn.ModuleDict()
+            for fs in self.supported_sample_rates:
+                self.branches[str(int(fs))] = nn.ModuleList(
+                    [
+                        nn.Conv2d(1, conv_kernels, (conv_kernel_size, 1), padding=self._std_pad),
+                        nn.Conv2d(conv_kernels, conv_kernels, (conv_kernel_size, 1), padding=self._std_pad),
+                        nn.Conv2d(conv_kernels, conv_kernels, (conv_kernel_size, 1), padding=self._std_pad),
+                        nn.Conv2d(conv_kernels, conv_kernels, (conv_kernel_size, 1), padding=self._std_pad),
+                    ]
+                )
 
         else:
-            raise ValueError(f"Unknown conv_type: {conv_type}")
+            raise ValueError(f"Unknown conv_type: {self.conv_type}")
 
         self.lstm = nn.LSTM(
-            channels * conv_kernels,
-            lstm_units,
-            num_layers=lstm_layers,
+            self.channels * self.conv_kernels,
+            self.lstm_units,
+            num_layers=self.lstm_layers,
         )
-        self.dropout = nn.Dropout(dropout)
-        self.classifier = nn.Linear(lstm_units, classes)
+        self.dropout = nn.Dropout(self.dropout_p)
+        self.classifier = nn.Linear(self.lstm_units, self.classes)
         self.activation = nn.ReLU()
 
         self.apply_gamma = apply_gamma
@@ -140,7 +161,7 @@ class DeepConvLSTM(nn.Module):
                 self.gamma_function = gammaFunction(init=gamma_type, offset=0.0)
             elif apply_gamma == "local":
                 self.gamma_functions = nn.ModuleList(
-                    [gammaFunction(init=gamma_type, offset=0.0) for _ in range(channels)]
+                    [gammaFunction(init=gamma_type, offset=0.0) for _ in range(self.channels)]
                 )
             else:
                 raise ValueError(f"Unknown apply_gamma mode: {apply_gamma}")
@@ -163,17 +184,16 @@ class DeepConvLSTM(nn.Module):
         xt = xt.view(B, C, int(target_len)).permute(0, 2, 1).contiguous()
         return xt
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, T, C]
         if x.ndim != 3:
             raise ValueError(f"DeepConvLSTM expected [B,T,C], got shape {tuple(x.shape)}")
 
         self.last_sample_rate = None  # reset every forward
-
         B, T, C = x.shape
 
         sample_rate = None
-        if self.conv_type == "continuous":
+        if self.conv_type in ("continuous", "standard_multibranch"):
             if self.training and self.multirate_training:
                 idx = torch.randint(low=0, high=len(self.supported_sample_rates), size=(1,), device=x.device).item()
                 fs = int(self.supported_sample_rates[idx])
@@ -211,6 +231,13 @@ class DeepConvLSTM(nn.Module):
             x = self.activation(branch[1](x, sample_rate=sample_rate))
             x = self.activation(branch[2](x, sample_rate=sample_rate))
             x = self.activation(branch[3](x, sample_rate=sample_rate))
+
+        elif self.conv_type == "standard_multibranch":
+            branch = self.branches[str(int(sample_rate))]
+            x = self.activation(branch[0](x))
+            x = self.activation(branch[1](x))
+            x = self.activation(branch[2](x))
+            x = self.activation(branch[3](x))
 
         else:
             raise ValueError(f"Unknown conv_type: {self.conv_type}")

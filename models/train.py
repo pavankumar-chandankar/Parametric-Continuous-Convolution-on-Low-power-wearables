@@ -1,4 +1,5 @@
 import os
+import math
 import numpy as np
 import pandas as pd
 
@@ -30,6 +31,8 @@ def _pretty_freq_tag_from_len(t: int) -> str:
 
 
 def _infer_multirate_lengths_from_model(net: nn.Module):
+    # For multi-branch models (continuous or standard_multibranch),
+    # infer supported input lengths from branch keys.
     if hasattr(net, "branches"):
         b = getattr(net, "branches")
         if isinstance(b, nn.ModuleDict):
@@ -45,6 +48,12 @@ def _infer_multirate_lengths_from_model(net: nn.Module):
 
 
 def _resample_time(x: torch.Tensor, target_len: int) -> torch.Tensor:
+    """
+    Resample time dimension for inertial windows.
+
+    Input:  x [B, T, C]
+    Output:   [B, target_len, C]
+    """
     x = x.contiguous()
     target_len = int(target_len)
     if x.shape[1] == target_len:
@@ -52,6 +61,27 @@ def _resample_time(x: torch.Tensor, target_len: int) -> torch.Tensor:
     x_t = x.transpose(1, 2)  # [B, C, T]
     x_rs = F.interpolate(x_t, size=target_len, mode="linear", align_corners=False)
     return x_rs.transpose(1, 2).contiguous()  # [B, T, C]
+
+
+def _infer_freq_tag_from_sampling_rate(sampling_rate: float) -> str:
+    sr = float(sampling_rate)
+    if abs(sr - 50.0) < 1e-3:
+        return "50hz"
+    if abs(sr - 25.0) < 1e-3:
+        return "25hz"
+    if abs(sr - 20.0) < 1e-3:
+        return "20hz"
+    if abs(sr - 15.0) < 1e-3:
+        return "15hz"
+    if abs(sr - 12.0) < 1e-3 or abs(sr - 12.5) < 1e-3:
+        return "12hz"
+    if abs(sr - 10.0) < 1e-3:
+        return "10hz"
+    if abs(sr - 6.0) < 1e-3:
+        return "6hz"
+    if abs(sr - 5.0) < 1e-3:
+        return "5hz"
+    return f"{sr:g}hz"
 
 
 def validate_one_epoch_resampled(loader, network, criterion, target_len: int, gpu=None):
@@ -81,6 +111,13 @@ def validate_one_epoch_resampled(loader, network, criterion, target_len: int, gp
     return losses, preds, gt
 
 
+def _estimate_model_size_bytes(params: int, bits_per_weight: int) -> int:
+    # purely a storage estimate for weights
+    if bits_per_weight <= 0:
+        raise ValueError("bits_per_weight must be > 0")
+    return int(math.ceil(params * bits_per_weight / 8.0))
+
+
 def run_inertial_network(
     train_sbjs,
     val_sbjs,
@@ -98,31 +135,24 @@ def run_inertial_network(
     split_name = os.path.splitext(os.path.basename(cfg["dataset"]["json_anno"]))[0]
     sampling_rate = float(cfg["dataset"]["sampling_rate"])
 
-    if abs(sampling_rate - 50.0) < 1e-3:
-        freq_tag = "50hz"
-    elif abs(sampling_rate - 25.0) < 1e-3:
-        freq_tag = "25hz"
-    elif abs(sampling_rate - 20.0) < 1e-3:
-        freq_tag = "20hz"
-    elif abs(sampling_rate - 15.0) < 1e-3:
-        freq_tag = "15hz"
-    elif abs(sampling_rate - 12.0) < 1e-3 or abs(sampling_rate - 12.5) < 1e-3:
-        freq_tag = "12hz"
-    elif abs(sampling_rate - 10.0) < 1e-3:
-        freq_tag = "10hz"
-    elif abs(sampling_rate - 6.0) < 1e-3:
-        freq_tag = "6hz"
-    elif abs(sampling_rate - 5.0) < 1e-3:
-        freq_tag = "5hz"
+    train_cfg = cfg.get("train_cfg", {})
+    freq_tag_override = train_cfg.get("freq_tag_override", None)
+    if freq_tag_override is not None and str(freq_tag_override).strip():
+        freq_tag = str(freq_tag_override).strip()
     else:
-        freq_tag = f"{sampling_rate:g}hz"
+        freq_tag = _infer_freq_tag_from_sampling_rate(sampling_rate)
 
-    ckpt_folder = os.path.join("logs", "deepconvlstm", freq_tag, split_name)
+    # Optional: put experiments under logs/deepconvlstm/<log_subdir>/<freq_tag>/<split>
+    log_subdir = train_cfg.get("log_subdir", None)
+    if log_subdir is not None and str(log_subdir).strip():
+        ckpt_folder = os.path.join("logs", "deepconvlstm", str(log_subdir).strip(), freq_tag, split_name)
+    else:
+        ckpt_folder = os.path.join("logs", "deepconvlstm", freq_tag, split_name)
     mkdir_if_missing(ckpt_folder)
 
     last_ckpt_path = os.path.join(ckpt_folder, f"last_{split_name}.pth.tar")
 
-    auto_resume = cfg.get("train_cfg", {}).get("auto_resume", True)
+    auto_resume = train_cfg.get("auto_resume", True)
     if (resume is None or resume == "") and auto_resume and os.path.isfile(last_ckpt_path):
         resume = last_ckpt_path
         print(f"Auto-resume: using {resume}")
@@ -146,9 +176,10 @@ def run_inertial_network(
 
     min_train = np.min(train_data[:, 1:-1])
     max_train = np.max(train_data[:, 1:-1])
+    denom = (max_train - min_train) if (max_train - min_train) != 0 else 1.0
 
-    train_data[:, 1:-1] = 2 * (train_data[:, 1:-1] - min_train) / (max_train - min_train) - 1
-    val_data[:, 1:-1] = 2 * (val_data[:, 1:-1] - min_train) / (max_train - min_train) - 1
+    train_data[:, 1:-1] = 2 * (train_data[:, 1:-1] - min_train) / denom - 1
+    val_data[:, 1:-1] = 2 * (val_data[:, 1:-1] - min_train) / denom - 1
 
     print(f"Training data shape: {train_data.shape}")
     print(f"Validation data shape: {val_data.shape}")
@@ -221,8 +252,9 @@ def run_inertial_network(
     conv_type = cfg["model"].get("conv_type", "standard")
     conv_rank = cfg["model"].get("conv_rank", 8)
     conv_mlp_hidden_dim = cfg["model"].get("conv_mlp_hidden_dim", 32)
+    kernel_support_s = cfg["model"].get("kernel_support_s", None)
+    standard_padding = cfg["model"].get("standard_padding", "valid")
 
-    # CRITICAL FIX: take supported_sample_rates from YAML (WISDM: [20,15,10,5], WEAR: [50,25,12,6])
     supported_sample_rates = cfg["model"].get("supported_sample_rates", (50, 25, 12, 6))
     multirate_training = cfg["model"].get("multirate_training", True)
 
@@ -244,13 +276,16 @@ def run_inertial_network(
         conv_mlp_hidden_dim=conv_mlp_hidden_dim,
         supported_sample_rates=supported_sample_rates,
         multirate_training=multirate_training,
+        kernel_support_s=kernel_support_s,
+        standard_padding=standard_padding,
     )
 
-    print(
-        "Number of learnable parameters for DeepConvLSTM: {}".format(
-            sum(p.numel() for p in net.parameters() if p.requires_grad)
-        )
-    )
+    params = sum(p.numel() for p in net.parameters() if p.requires_grad)
+    size_fp32 = _estimate_model_size_bytes(params, bits_per_weight=32)
+    size_q4 = _estimate_model_size_bytes(params, bits_per_weight=4)
+
+    print(f"Number of learnable parameters for DeepConvLSTM: {params}")
+    print(f"Estimated weight storage: FP32 {size_fp32/1e6:.3f} MB | 4-bit {size_q4/1e6:.3f} MB (estimate)")
     print(net)
 
     gpu = torch.device("cuda") if torch.cuda.is_available() else None
@@ -259,7 +294,7 @@ def run_inertial_network(
 
     criterion = nn.CrossEntropyLoss()
 
-    if cfg["train_cfg"].get("weighted_loss", False):
+    if train_cfg.get("weighted_loss", False):
         class_weights = compute_class_weight(
             "balanced", classes=np.unique(train_dataset.labels), y=train_dataset.labels
         )
@@ -271,21 +306,24 @@ def run_inertial_network(
 
     opt = torch.optim.Adam(
         net.parameters(),
-        lr=cfg["train_cfg"]["lr"],
-        weight_decay=cfg["train_cfg"]["weight_decay"],
+        lr=train_cfg["lr"],
+        weight_decay=train_cfg["weight_decay"],
     )
     scheduler = None
-    if cfg["train_cfg"]["lr_step"] > 0:
+    if train_cfg["lr_step"] > 0:
         scheduler = torch.optim.lr_scheduler.StepLR(
             opt,
-            step_size=cfg["train_cfg"]["lr_step"],
-            gamma=cfg["train_cfg"]["lr_decay"],
+            step_size=train_cfg["lr_step"],
+            gamma=train_cfg["lr_decay"],
         )
 
     start_epoch = 0
     best_f1 = -1.0
     best_epoch = -1
     best_v_mAP_vec = None
+
+    best_preds = None
+    best_gt = None
 
     if resume is not None and resume != "":
         if os.path.isfile(resume):
@@ -299,7 +337,7 @@ def run_inertial_network(
         else:
             print(f"No checkpoint found at '{resume}'")
     else:
-        net = init_weights(net, cfg["train_cfg"]["weight_init"])
+        net = init_weights(net, train_cfg["weight_init"])
 
     det_eval = ANETdetection(
         cfg["dataset"]["json_anno"],
@@ -311,10 +349,7 @@ def run_inertial_network(
     v_losses = []
     v_mAP_all = []
 
-    v_preds_out = None
-    v_gt_out = None
-
-    mr_cfg = cfg.get("train_cfg", {}).get("multirate_val_lengths", None)
+    mr_cfg = train_cfg.get("multirate_val_lengths", None)
     if mr_cfg is not None:
         multirate_lengths = [int(x) for x in mr_cfg]
     else:
@@ -324,9 +359,29 @@ def run_inertial_network(
     multirate_lengths = [int(x) for x in multirate_lengths if int(x) > 0]
     multirate_lengths = sorted(set(multirate_lengths), reverse=True)
 
-    save_per_class_multirate = bool(cfg.get("train_cfg", {}).get("multirate_save_per_class", True))
+    save_per_class_multirate = bool(train_cfg.get("multirate_save_per_class", True))
 
-    for epoch in range(start_epoch, cfg["train_cfg"]["epochs"]):
+    # Optional: force training/validation to a specific effective input length.
+    resample_train_len = train_cfg.get("resample_train_len", None)
+    resample_val_len = train_cfg.get("resample_val_len", None)
+    if resample_train_len is not None:
+        resample_train_len = int(resample_train_len)
+    if resample_val_len is not None:
+        resample_val_len = int(resample_val_len)
+
+    # If the model itself does multirate resampling (continuous/standard_multibranch with multirate_training),
+    # ignore external resampling to avoid "double resampling".
+    model_ref0 = net.module if hasattr(net, "module") else net
+    model_handles_multirate = bool(getattr(model_ref0, "multirate_training", False)) and \
+        (getattr(model_ref0, "conv_type", "") in ("continuous", "standard_multibranch"))
+
+    if model_handles_multirate:
+        if resample_train_len is not None or resample_val_len is not None:
+            print("[WARN] resample_train_len/resample_val_len set, but model uses internal multirate training. Ignoring external resampling.")
+        resample_train_len = None
+        resample_val_len = None
+
+    for epoch in range(start_epoch, train_cfg["epochs"]):
         net.train()
         train_epoch_losses = []
 
@@ -348,6 +403,9 @@ def run_inertial_network(
             if gpu is not None:
                 inputs = inputs.to(gpu)
                 targets = targets.to(gpu)
+
+            if resample_train_len is not None:
+                inputs = _resample_time(inputs, resample_train_len)
 
             outputs = net(inputs)
 
@@ -374,6 +432,7 @@ def run_inertial_network(
                     for h in order
                 )
 
+        # ---- validation (primary) ----
         net.eval()
         with torch.no_grad():
             val_epoch_losses = []
@@ -384,6 +443,9 @@ def run_inertial_network(
                 if gpu is not None:
                     inputs = inputs.to(gpu)
                     targets = targets.to(gpu)
+
+                if resample_val_len is not None:
+                    inputs = _resample_time(inputs, resample_val_len)
 
                 outputs = net(inputs)
                 loss = criterion(outputs, targets.long())
@@ -396,25 +458,23 @@ def run_inertial_network(
                 gt = np.concatenate((gt, batch_gt))
 
         v_losses.append(float(np.nanmean(val_epoch_losses)))
-        v_preds_out = preds
-        v_gt_out = gt
 
-        conf_mat = confusion_matrix(v_gt_out, v_preds_out, normalize="true")
+        conf_mat = confusion_matrix(gt, preds, normalize="true")
         v_acc = conf_mat.diagonal()
-
-        v_prec = precision_score(v_gt_out, v_preds_out, average=None, zero_division=1)
-        v_rec = recall_score(v_gt_out, v_preds_out, average=None, zero_division=1)
-        v_f1 = f1_score(v_gt_out, v_preds_out, average=None, zero_division=1)
+        v_prec = precision_score(gt, preds, average=None, zero_division=1)
+        v_rec = recall_score(gt, preds, average=None, zero_division=1)
+        v_f1 = f1_score(gt, preds, average=None, zero_division=1)
 
         avg_acc = float(np.nanmean(v_acc) * 100.0)
         avg_prec = float(np.nanmean(v_prec) * 100.0)
         avg_rec = float(np.nanmean(v_rec) * 100.0)
         avg_f1 = float(np.nanmean(v_f1) * 100.0)
 
+        # ---- map evaluation is always computed at the dataset sampling rate ----
         unseg_preds, _ = unwindow_inertial_data(
             val_data,
             test_dataset.ids,
-            v_preds_out,
+            preds,
             cfg["dataset"]["window_size"],
             cfg["dataset"]["window_overlap"],
         )
@@ -422,29 +482,62 @@ def run_inertial_network(
             val_data[:, 0], unseg_preds, cfg["dataset"]["sampling_rate"]
         )
 
-        if epoch == (cfg["train_cfg"]["epochs"] - 1):
-            v_results = pd.DataFrame(
-                {
-                    "video_id": v_segments["video-id"],
-                    "t_start": v_segments["t-start"].tolist(),
-                    "t_end": v_segments["t-end"].tolist(),
-                    "label": v_segments["label"].tolist(),
-                    "score": v_segments["score"].tolist(),
-                }
-            )
-            unproc_dir = os.path.join(ckpt_folder, "unprocessed_results")
-            mkdir_if_missing(unproc_dir)
-            np.save(os.path.join(unproc_dir, f"v_preds_{split_name}.npy"), v_preds_out)
-            np.save(os.path.join(unproc_dir, f"v_gt_{split_name}.npy"), v_gt_out)
-            v_results.to_csv(
-                os.path.join(unproc_dir, f"v_seg_{split_name}.csv"),
-                index=False,
-            )
-
         v_mAP_vec, _ = det_eval.evaluate(v_segments)
         v_mAP_all.append(v_mAP_vec)
 
-        block1 = "Epoch: [{:03d}/{:03d}]".format(epoch + 1, cfg["train_cfg"]["epochs"])
+        # ---- optional extra eval lengths (multi-rate evaluation) ----
+        extra_eval = {}
+        if multirate_lengths:
+            for L in multirate_lengths:
+                L = int(L)
+                # If primary val already uses this length, skip.
+                if resample_val_len is not None and int(L) == int(resample_val_len):
+                    continue
+                if resample_val_len is None and int(L) == int(base_len):
+                    continue
+
+                v_losses_L, v_preds_L, v_gt_L = validate_one_epoch_resampled(
+                    test_loader, net, criterion, target_len=L, gpu=gpu
+                )
+
+                conf_L = confusion_matrix(v_gt_L, v_preds_L, normalize="true")
+                v_acc_L = conf_L.diagonal()
+                v_prec_L = precision_score(v_gt_L, v_preds_L, average=None, zero_division=1)
+                v_rec_L = recall_score(v_gt_L, v_preds_L, average=None, zero_division=1)
+                v_f1_L = f1_score(v_gt_L, v_preds_L, average=None, zero_division=1)
+
+                avg_acc_L = float(np.nanmean(v_acc_L) * 100.0)
+                avg_prec_L = float(np.nanmean(v_prec_L) * 100.0)
+                avg_rec_L = float(np.nanmean(v_rec_L) * 100.0)
+                avg_f1_L = float(np.nanmean(v_f1_L) * 100.0)
+
+                tagL = _pretty_freq_tag_from_len(L)
+                extra_eval[L] = {
+                    "eval_len": L,
+                    "freq_tag": tagL,
+                    "loss": float(np.nanmean(v_losses_L)),
+                    "acc_mean": avg_acc_L,
+                    "prec_mean": avg_prec_L,
+                    "rec_mean": avg_rec_L,
+                    "f1_mean": avg_f1_L,
+                    "per_class": (v_acc_L, v_prec_L, v_rec_L, v_f1_L),
+                }
+
+                print(f"VALIDATION@{tagL}:\tavg. loss {extra_eval[L]['loss']:.4f}")
+                print(
+                    f"\t\tAcc {avg_acc_L:4.2f} (%) Prec {avg_prec_L:4.2f} (%) "
+                    f"Rec {avg_rec_L:4.2f} (%) F1 {avg_f1_L:4.2f} (%)"
+                )
+
+                if run is not None:
+                    run[f"val_{tagL}/loss"].log(extra_eval[L]["loss"])
+                    run[f"val_{tagL}/acc_mean"].log(avg_acc_L)
+                    run[f"val_{tagL}/prec_mean"].log(avg_prec_L)
+                    run[f"val_{tagL}/rec_mean"].log(avg_rec_L)
+                    run[f"val_{tagL}/f1_mean"].log(avg_f1_L)
+
+        # ---- printing ----
+        block1 = "Epoch: [{:03d}/{:03d}]".format(epoch + 1, train_cfg["epochs"])
         block2 = "TRAINING:\tavg. loss {:4.4f}".format(t_losses[-1])
         block3 = "VALIDATION:\tavg. loss {:4.4f}".format(v_losses[-1])
 
@@ -477,72 +570,13 @@ def run_inertial_network(
             run["val/rec_mean"].log(avg_rec)
             run["val/f1_mean"].log(avg_f1)
 
-        if multirate_lengths:
-            for L in multirate_lengths:
-                L = int(L)
-                if L == base_len:
-                    continue
-
-                v_losses_L, v_preds_L, v_gt_L = validate_one_epoch_resampled(
-                    test_loader, net, criterion, target_len=L, gpu=gpu
-                )
-
-                conf_L = confusion_matrix(v_gt_L, v_preds_L, normalize="true")
-                v_acc_L = conf_L.diagonal()
-                v_prec_L = precision_score(v_gt_L, v_preds_L, average=None, zero_division=1)
-                v_rec_L = recall_score(v_gt_L, v_preds_L, average=None, zero_division=1)
-                v_f1_L = f1_score(v_gt_L, v_preds_L, average=None, zero_division=1)
-
-                avg_acc_L = float(np.nanmean(v_acc_L) * 100.0)
-                avg_prec_L = float(np.nanmean(v_prec_L) * 100.0)
-                avg_rec_L = float(np.nanmean(v_rec_L) * 100.0)
-                avg_f1_L = float(np.nanmean(v_f1_L) * 100.0)
-
-                tagL = _pretty_freq_tag_from_len(L)
-                print(f"VALIDATION@{tagL}:\tavg. loss {float(np.nanmean(v_losses_L)):.4f}")
-                print(
-                    f"\t\tAcc {avg_acc_L:4.2f} (%) Prec {avg_prec_L:4.2f} (%) "
-                    f"Rec {avg_rec_L:4.2f} (%) F1 {avg_f1_L:4.2f} (%)"
-                )
-
-                if run is not None:
-                    run[f"val_{tagL}/loss"].log(float(np.nanmean(v_losses_L)))
-                    run[f"val_{tagL}/acc_mean"].log(avg_acc_L)
-                    run[f"val_{tagL}/prec_mean"].log(avg_prec_L)
-                    run[f"val_{tagL}/rec_mean"].log(avg_rec_L)
-                    run[f"val_{tagL}/f1_mean"].log(avg_f1_L)
-
-                if save_per_class_multirate:
-                    num_classes_L = len(v_acc_L)
-                    if class_id2name is not None and len(class_id2name) == num_classes_L:
-                        class_names_L = [class_id2name[i] for i in range(num_classes_L)]
-                    else:
-                        class_names_L = [f"class_{i}" for i in range(num_classes_L)]
-
-                    per_class_df_L = pd.DataFrame(
-                        {
-                            "split": [split_name] * num_classes_L,
-                            "sampling_rate_cfg": [sampling_rate] * num_classes_L,
-                            "eval_len": [L] * num_classes_L,
-                            "eval_tag": [tagL] * num_classes_L,
-                            "epoch": [epoch + 1] * num_classes_L,
-                            "class_id": list(range(num_classes_L)),
-                            "class_name": class_names_L,
-                            "acc": v_acc_L,
-                            "prec": v_prec_L,
-                            "rec": v_rec_L,
-                            "f1": v_f1_L,
-                        }
-                    )
-                    per_class_path_L = os.path.join(
-                        ckpt_folder, f"per_class_metrics_{split_name}_{tagL}.csv"
-                    )
-                    per_class_df_L.to_csv(per_class_path_L, index=False)
-
+        # ---- best checkpoint & metric export ----
         if avg_f1 > best_f1:
             best_f1 = avg_f1
             best_epoch = epoch + 1
             best_v_mAP_vec = v_mAP_vec
+            best_preds = preds.copy()
+            best_gt = gt.copy()
 
             ckpt_name = f"best_{split_name}.pth.tar"
             print(
@@ -561,18 +595,40 @@ def run_inertial_network(
                 file_name=ckpt_name,
             )
 
+            # ----- per-class metrics (primary) -----
             num_classes = len(v_acc)
             if class_id2name is not None and len(class_id2name) == num_classes:
                 class_names = [class_id2name[i] for i in range(num_classes)]
             else:
                 class_names = [f"class_{i}" for i in range(num_classes)]
 
+            primary_eval_len = int(resample_val_len) if resample_val_len is not None else int(base_len)
+            primary_tag = str(freq_tag)
+
+            meta_common = {
+                "split": split_name,
+                "dataset_name": cfg.get("dataset_name", ""),
+                "sampling_rate_cfg": sampling_rate,
+                "window_size_cfg": int(cfg["dataset"]["window_size"]),
+                "eval_len": primary_eval_len,
+                "freq_tag": primary_tag,
+                "epoch": best_epoch,
+                "conv_type": conv_type,
+                "conv_kernel_size": int(cfg["model"]["conv_kernel_size"]),
+                "standard_padding": str(standard_padding),
+                "kernel_support_s": float(kernel_support_s) if kernel_support_s is not None else float(getattr(model_ref0, "kernel_support_s", float("nan"))),
+                "gamma_quant": str(gamma_quant) if gamma_quant is not None else "none",
+                "quant_bits": int(quant_bits),
+                "gamma_type": str(gamma_type),
+                "apply_gamma": str(apply_gamma),
+                "params": int(params),
+                "size_fp32_bytes": int(size_fp32),
+                "size_4bit_bytes": int(size_q4),
+            }
+
             per_class_df = pd.DataFrame(
                 {
-                    "split": [split_name] * num_classes,
-                    "sampling_rate": [sampling_rate] * num_classes,
-                    "freq_tag": [freq_tag] * num_classes,
-                    "epoch": [epoch + 1] * num_classes,
+                    **{k: [v] * num_classes for k, v in meta_common.items()},
                     "class_id": list(range(num_classes)),
                     "class_name": class_names,
                     "acc": v_acc,
@@ -581,11 +637,61 @@ def run_inertial_network(
                     "f1": v_f1,
                 }
             )
-            per_class_path = os.path.join(
-                ckpt_folder, f"per_class_metrics_{split_name}.csv"
-            )
+            per_class_path = os.path.join(ckpt_folder, f"per_class_metrics_{split_name}.csv")
             per_class_df.to_csv(per_class_path, index=False)
 
+            # ----- macro metrics summary (rows: primary + extra eval) -----
+            macro_rows = [{
+                **meta_common,
+                "loss": float(np.nanmean(val_epoch_losses)),
+                "acc_mean": avg_acc,
+                "prec_mean": avg_prec,
+                "rec_mean": avg_rec,
+                "f1_mean": avg_f1,
+            }]
+
+            if save_per_class_multirate and extra_eval:
+                for L, d in extra_eval.items():
+                    L = int(L)
+                    tagL = str(d["freq_tag"])
+                    v_acc_L, v_prec_L, v_rec_L, v_f1_L = d["per_class"]
+                    num_classes_L = len(v_acc_L)
+                    if class_id2name is not None and len(class_id2name) == num_classes_L:
+                        class_names_L = [class_id2name[i] for i in range(num_classes_L)]
+                    else:
+                        class_names_L = [f"class_{i}" for i in range(num_classes_L)]
+
+                    meta_L = dict(meta_common)
+                    meta_L["eval_len"] = L
+                    meta_L["freq_tag"] = tagL
+
+                    per_class_df_L = pd.DataFrame(
+                        {
+                            **{k: [v] * num_classes_L for k, v in meta_L.items()},
+                            "class_id": list(range(num_classes_L)),
+                            "class_name": class_names_L,
+                            "acc": v_acc_L,
+                            "prec": v_prec_L,
+                            "rec": v_rec_L,
+                            "f1": v_f1_L,
+                        }
+                    )
+                    per_class_path_L = os.path.join(ckpt_folder, f"per_class_metrics_{split_name}_{tagL}.csv")
+                    per_class_df_L.to_csv(per_class_path_L, index=False)
+
+                    macro_rows.append({
+                        **meta_L,
+                        "loss": float(d["loss"]),
+                        "acc_mean": float(d["acc_mean"]),
+                        "prec_mean": float(d["prec_mean"]),
+                        "rec_mean": float(d["rec_mean"]),
+                        "f1_mean": float(d["f1_mean"]),
+                    })
+
+            best_macro_path = os.path.join(ckpt_folder, f"best_macro_metrics_{split_name}.csv")
+            pd.DataFrame(macro_rows).to_csv(best_macro_path, index=False)
+
+        # always save last
         save_checkpoint(
             {
                 "epoch": epoch + 1,
@@ -606,7 +712,13 @@ def run_inertial_network(
     else:
         v_mAP_best = np.array(best_v_mAP_vec, dtype=float)
 
-    return t_losses, v_losses, v_mAP_best, v_preds_out, v_gt_out, net
+    # return BEST epoch preds/gt if available
+    if best_preds is None:
+        best_preds = preds
+    if best_gt is None:
+        best_gt = gt
+
+    return t_losses, v_losses, v_mAP_best, best_preds, best_gt, net
 
 
 def validate_one_epoch(loader, network, criterion, gpu=None):
@@ -616,7 +728,7 @@ def validate_one_epoch(loader, network, criterion, gpu=None):
     gt = np.array([], dtype=np.int64)
 
     with torch.no_grad():
-        for i, (inputs, targets) in enumerate(loader):
+        for _, (inputs, targets) in enumerate(loader):
             if gpu is not None:
                 inputs = inputs.to(gpu)
                 targets = targets.to(gpu)

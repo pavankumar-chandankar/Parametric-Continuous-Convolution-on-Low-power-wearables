@@ -1,22 +1,48 @@
+# Python
 __pycache__/
 *.py[cod]
-.DS_Store
-.vscode/
-.idea/
+*.so
+*.egg-info/
 .venv/
 venv/
-.env/
+.env
+.ipynb_checkpoints/
 
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Data / artifacts (DO NOT COMMIT)
 data/
-checkpoints/
 logs/
+checkpoints/
 slurm_logs/
-*.out
-*.err
+runs/
+wandb/
+neptune/
 
-*.pt
+# Model / binaries
 *.pth
-*.ckpt
+*.pth.tar
+*.pt
 *.onnx
+*.ckpt
 *.npz
-*.h5
+*.npy
+*.pkl
+
+# Archives
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# Local scratch / temp
+tmp/
+*.tmp
