@@ -1,0 +1,5 @@
+freq_tag,sample_rate_hz,effective_kernel,kernel_support_s,base_conv_kernel_size,window_size
+50hz,50,9,0.18,9,50
+25hz,25,5,0.18,9,50
+12hz,12,3,0.18,9,50
+6hz,6,1,0.18,9,50

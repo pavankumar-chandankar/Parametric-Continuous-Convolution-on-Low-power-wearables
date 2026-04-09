@@ -67,6 +67,10 @@ class ContinuousConv2d(nn.Module):
         self.coord_min = float(coord_min)
         self.coord_max = float(coord_max)
 
+        # debug / introspection
+        self.last_k_t = None
+        self.last_sample_rate = None
+
         self.mlp = nn.Sequential(
             nn.Linear(1, mlp_hidden_dim),
             nn.ReLU(inplace=True),
@@ -92,13 +96,9 @@ class ContinuousConv2d(nn.Module):
         return self._make_odd(k)
 
     def _build_kernel(self, k_t: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        # positions: [K, 1]
         positions = torch.linspace(self.coord_min, self.coord_max, k_t, device=device, dtype=dtype).unsqueeze(-1)
-        # g: [K, R]
         g = self.mlp(positions)
-        # K_t: [O, I, K]
         K_t = torch.einsum("oir,kr->oik", self.channel_weights, g)
-        # K: [O, I, K, 1]
         return K_t.unsqueeze(-1)
 
     def forward(self, x: torch.Tensor, sample_rate: Optional[float] = None) -> torch.Tensor:
@@ -108,8 +108,11 @@ class ContinuousConv2d(nn.Module):
             )
 
         k_t = self._effective_kernel_size_time(sample_rate)
+
+        self.last_k_t = int(k_t)
+        self.last_sample_rate = None if sample_rate is None else int(sample_rate)
+
         K = self._build_kernel(k_t, device=x.device, dtype=x.dtype)
 
         pad_t = (k_t // 2) if (self.padding_mode == "same") else 0
         return F.conv2d(x, K, bias=self.bias, padding=(pad_t, 0))
-

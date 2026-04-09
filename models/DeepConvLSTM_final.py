@@ -70,8 +70,10 @@ class DeepConvLSTM(nn.Module):
         self.supported_sample_rates = [int(x) for x in supported_sample_rates]
         self.multirate_training = bool(multirate_training) and (self.conv_type in ("continuous", "standard_multibranch"))
 
-        # Debug: used by train.py to print branch usage stats
+        # Debug: used by train.py / evaluation to print branch usage stats
         self.last_sample_rate = None  # int | None
+        self.last_effective_kernel_size = None
+        self.last_effective_kernel_sizes_per_layer = None
 
         # In our datasets, configs use ~1-second windows where window_size == sampling_rate.
         # So conv_kernel_size / window_size is a reasonable "seconds" support default.
@@ -231,6 +233,14 @@ class DeepConvLSTM(nn.Module):
             x = self.activation(branch[1](x, sample_rate=sample_rate))
             x = self.activation(branch[2](x, sample_rate=sample_rate))
             x = self.activation(branch[3](x, sample_rate=sample_rate))
+
+            self.last_effective_kernel_sizes_per_layer = [
+                int(branch[0].last_k_t),
+                int(branch[1].last_k_t),
+                int(branch[2].last_k_t),
+                int(branch[3].last_k_t),
+            ]
+            self.last_effective_kernel_size = int(branch[0].last_k_t)
 
         elif self.conv_type == "standard_multibranch":
             branch = self.branches[str(int(sample_rate))]

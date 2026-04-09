@@ -1,0 +1,12 @@
+{
+  "config": "/home/g263412/GAMMA/configs/continuous_conv/realworld_waist_accel_loso_Multirate.yaml",
+  "base_conv_kernel_size": 9,
+  "window_size": 50,
+  "kernel_support_s": 0.18,
+  "effective_kernel_by_freq": {
+    "50hz": 9,
+    "25hz": 5,
+    "12hz": 3,
+    "6hz": 1
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "config": "/home/g263412/GAMMA/configs/continuous_conv/wisdm_watch_accel_loso_Multirate.yaml",
+  "base_conv_kernel_size": 9,
+  "window_size": 20,
+  "kernel_support_s": 0.45,
+  "effective_kernel_by_freq": {
+    "20hz": 9,
+    "10hz": 5,
+    "5hz": 3
+  }
+}
